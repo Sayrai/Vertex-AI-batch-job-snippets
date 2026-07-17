@@ -1,0 +1,55 @@
+from google.cloud import aiplatform
+
+aiplatform.init(
+    project=<project name>,
+    location=<location>
+)
+
+job = aiplatform.BatchPredictionJob.create(
+    job_display_name="genai-batch-test",
+
+    model_name=<model name>,
+
+    instances_format="jsonl",
+
+    gcs_source=<bucket url for input>,
+
+    gcs_destination_prefix=<bucket output url>,
+     
+    labels={
+        "cloudcostcentre": "",
+        "envtype": "",
+        "owner": "",
+        "component": "",
+    }
+
+)
+print("Printing Labels:", job.labels)
+print("Created:", job.resource_name)
+
+# Get (fetch one job by resource name)
+same_job = aiplatform.BatchPredictionJob(batch_prediction_job_name=job.resource_name)
+print("Got:", same_job.resource_name, same_job.state)
+
+# List (iterate jobs)
+for j in aiplatform.BatchPredictionJob.list():
+    print(j.resource_name, j.state)
+
+# Cancel (on a running/pending job)
+if same_job.state in (
+    aiplatform.compat.types.job_state.JobState.JOB_STATE_PENDING,
+    aiplatform.compat.types.job_state.JobState.JOB_STATE_RUNNING,
+):
+    same_job.cancel()
+    print("Cancel requested for:", same_job.resource_name)
+else:
+    print(f"Job already in terminal state: {same_job.state.name}")
+
+print("Cancel requested for:", same_job.resource_name)
+print("Cancelation successful for:", same_job.resource_name)
+
+
+print(job.resource_name)
+print(job.state)
+print(job.output_info.gcs_output_directory)
+print(job.error)
