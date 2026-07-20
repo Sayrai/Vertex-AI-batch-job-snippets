@@ -1,0 +1,267 @@
+import os
+import json
+import time
+from datetime import datetime, timezone
+from google import genai
+from google.genai import types
+
+RUN_LIVE = os.getenv("RUN_LIVE", "true").lower() == "true"
+
+os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
+os.environ["GOOGLE_CLOUD_PROJECT"] = <project name>
+os.environ["GOOGLE_CLOUD_LOCATION"] = <location>
+
+client = genai.Client()
+model = "gemini-2.5-flash"
+
+# Large context for caching
+system_context = """
+You are a pricing analyst assistant.
+- analyse pricing strategies
+- evaluate discount effectiveness
+- compare competitor prices
+- suggest optimal pricing models
+- consider historical sales trends
+- provide structured recommendations
+""" * 50
+
+user_prompt = "What is the best pricing strategy?"
+
+request_config = types.GenerateContentConfig(
+    labels={
+        "cloudcostcentre": "",
+        "envtype": "",
+        "owner": "",
+    },
+    max_output_tokens=300,   # ✅ stabilise latency
+    temperature=0.0
+)
+
+# ✅ Result structure
+result = {
+    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    "project": os.environ["GOOGLE_CLOUD_PROJECT"],
+    "location": os.environ["GOOGLE_CLOUD_LOCATION"],
+    "model": model,
+    "tests": {}
+}
+
+if not RUN_LIVE:
+    print("DRY RUN")
+    print(json.dumps(result, indent=2))
+
+else:
+    cache_name = None
+
+    # -------------------------------
+    # WITHOUT CACHE (baseline)
+    # -------------------------------
+    try:
+        start = time.time()
+
+        response_no_cache = client.models.generate_content(
+            model=model,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_text(
+                            text=system_context + "\n\n" + user_prompt
+                        )
+                    ]
+                )
+            ],
+            config=request_config,
+        )
+
+        latency_no_cache = time.time() - start
+        no_cache_tokens = getattr(response_no_cache, "usage_metadata", None)
+
+    except Exception as e:
+        latency_no_cache = None
+        no_cache_tokens = None
+
+    # -------------------------------
+    # CREATE
+    # -------------------------------
+    try:
+        cache = client.caches.create(
+            model=model,
+            config=types.CreateCachedContentConfig(
+                display_name="pricing-context-crud-test",
+                contents=[
+                    types.Content(
+                        role="user",
+                        parts=[types.Part.from_text(text=system_context)]
+                    )
+                ],
+                ttl="3600s",
+            ),
+        )
+
+        cache_name = cache.name
+
+        result["tests"]["create"] = {
+            "status": "PASS",
+            "cache_name": cache_name
+        }
+
+    except Exception as e:
+        result["tests"]["create"] = {
+            "status": "FAIL",
+            "error": str(e)
+        }
+
+    # -------------------------------
+    # GET
+    # -------------------------------
+    try:
+        fetched = client.caches.get(name=cache_name)
+
+        result["tests"]["get"] = {
+            "status": "PASS",
+            "fetched_name": fetched.name,
+            "display_name": getattr(fetched, "display_name", None),
+        }
+
+    except Exception as e:
+        result["tests"]["get"] = {
+            "status": "FAIL",
+            "error": str(e)
+        }
+
+    # -------------------------------
+    # LIST
+    # -------------------------------
+    try:
+        listed_names = [
+            c.name for c in client.caches.list(
+                config=types.ListCachedContentsConfig(page_size=50)
+            )
+        ]
+
+        result["tests"]["list"] = {
+            "status": "PASS" if cache_name in listed_names else "FAIL",
+            "found_created_cache": cache_name in listed_names,
+            "listed_count": len(listed_names),
+        }
+
+    except Exception as e:
+        result["tests"]["list"] = {
+            "status": "FAIL",
+            "error": str(e)
+        }
+
+    # -------------------------------
+    # UPDATE
+    # -------------------------------
+    try:
+        updated = client.caches.update(
+            name=cache_name,
+            config=types.UpdateCachedContentConfig(ttl="7200s"),
+        )
+
+        result["tests"]["update"] = {
+            "status": "PASS",
+            "updated_name": updated.name,
+        }
+
+    except Exception as e:
+        result["tests"]["update"] = {
+            "status": "FAIL",
+            "error": str(e)
+        }
+
+    # -------------------------------
+    # WITH CACHE (latency + tokens)
+    # -------------------------------
+    try:
+        # warm-up
+        client.models.generate_content(
+            model=model,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=user_prompt)]
+                )
+            ],
+            config={"cached_content": cache_name, **request_config.__dict__},
+        )
+
+        start = time.time()
+
+        response_with_cache = client.models.generate_content(
+            model=model,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=user_prompt)]
+                )
+            ],
+            config={"cached_content": cache_name, **request_config.__dict__},
+        )
+
+        latency_with_cache = time.time() - start
+        with_cache_tokens = getattr(response_with_cache, "usage_metadata", None)
+
+    except Exception as e:
+        latency_with_cache = None
+        with_cache_tokens = None
+
+    # -------------------------------
+    # TOKEN + LATENCY SUMMARY
+    # -------------------------------
+    try:
+        result["metrics"] = {
+            "latency_no_cache_s": latency_no_cache,
+            "latency_with_cache_s": latency_with_cache,
+        }
+
+        if no_cache_tokens and with_cache_tokens:
+            nc = no_cache_tokens.prompt_token_count
+            wc = with_cache_tokens.prompt_token_count
+
+            result["metrics"]["prompt_tokens_no_cache"] = nc
+            result["metrics"]["prompt_tokens_with_cache"] = wc
+            result["metrics"]["token_savings"] = nc - wc
+            result["metrics"]["token_savings_percent"] = round(((nc - wc) / nc) * 100, 2)
+
+    except:
+        pass
+
+    # -------------------------------
+    # DELETE
+    # -------------------------------
+    try:
+        client.caches.delete(name=cache_name)
+
+        result["tests"]["delete"] = {
+            "status": "PASS",
+            "deleted_name": cache_name
+        }
+
+    except Exception as e:
+        result["tests"]["delete"] = {
+            "status": "FAIL",
+            "error": str(e)
+        }
+
+    # -------------------------------
+    # POST-DELETE CHECK
+    # -------------------------------
+    try:
+        client.caches.get(name=cache_name)
+
+        result["tests"]["post_delete_check"] = {
+            "status": "FAIL",
+            "message": "Cache still exists"
+        }
+
+    except Exception:
+        result["tests"]["post_delete_check"] = {
+            "status": "PASS",
+            "message": "Cache no longer retrievable"
+        }
+
+    # ✅ FINAL OUTPUT
+    print(json.dumps(result, indent=2))
